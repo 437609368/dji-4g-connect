@@ -383,6 +383,7 @@ final class ModemManager: ObservableObject {
     @Published var apn = UserDefaults.standard.string(forKey: "lastAPN") ?? ""
     @Published var enableECMSwitch = false
     @Published var operatorName = "等待模块"
+    @Published var localNumber = "未读取"
     @Published var usbMode = "未读取"
     @Published var signalText = "—"
     @Published var network: NetworkInterfaceInfo?
@@ -398,6 +399,7 @@ final class ModemManager: ObservableObject {
     private var channel: (any ATChannel)?
     private var refreshTimer: Timer?
     private var networkTimer: Timer?
+    private var smsTimer: Timer?
     private var callTimer: Timer?
     private var manuallyDisconnected = false
     private var lastATAttempt: Date?
@@ -531,6 +533,8 @@ final class ModemManager: ObservableObject {
         manuallyDisconnected = true
         networkTimer?.invalidate()
         networkTimer = nil
+        smsTimer?.invalidate()
+        smsTimer = nil
         callTimer?.invalidate()
         callTimer = nil
         if let channel {
@@ -549,6 +553,20 @@ final class ModemManager: ObservableObject {
     }
 
     func clearLogs() { logs.removeAll() }
+
+    func startSMSAutoRefresh() {
+        smsTimer?.invalidate()
+        smsTimer = nil
+        loadMessages(silent: true)
+        smsTimer = Timer.scheduledTimer(withTimeInterval: 12, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.loadMessages(silent: true) }
+        }
+    }
+
+    func stopSMSAutoRefresh() {
+        smsTimer?.invalidate()
+        smsTimer = nil
+    }
 
     private func openATIfAvailable() {
         lastATAttempt = Date()
@@ -588,16 +606,21 @@ final class ModemManager: ObservableObject {
         }
     }
 
-    func loadMessages() {
-        guard let channel else { fail("读取短信需要 AT 接口；当前 USB AT 通道不可用。"); return }
+    func loadMessages(silent: Bool = false) {
+        guard let channel else {
+            if !silent { fail("读取短信需要 AT 接口；当前 USB AT 通道不可用。") }
+            return
+        }
         do {
             _ = try command("AT+CMGF=1")
             _ = try command("AT+CSCS=\"UCS2\"")
             let response = try channel.send("AT+CMGL=\"ALL\"", timeout: 4)
             messages = parseMessages(response)
             upsertIncomingMessages(messages)
-            appendLog("已读取 \(messages.count) 条短信")
-        } catch { fail(error.localizedDescription) }
+            if !silent { appendLog("已读取 \(messages.count) 条短信") }
+        } catch {
+            if !silent { fail(error.localizedDescription) }
+        }
     }
 
     func sendMessage(to recipient: String, body: String) {
@@ -619,6 +642,10 @@ final class ModemManager: ObservableObject {
         guard value.range(of: "^[+0-9*#()-]+$", options: .regularExpression) != nil else { fail("请输入有效的电话号码"); return }
         guard channel != nil else { fail("拨打电话需要 AT 接口；当前 USB AT 通道不可用。"); return }
         do {
+            _ = try? command("AT+CLIP=1")
+            _ = try? command("AT+COLP=1")
+            _ = try? command("AT+QINDCFG=\"ccinfo\",1")
+            _ = try? command("AT+QINDCFG=\"all\",1")
             _ = try command("ATD\(value);")
             callState = .calling(value)
             callEverConnected = false
@@ -753,7 +780,19 @@ final class ModemManager: ObservableObject {
                 _ = try? command("AT+COPS=3,0")
             }
         }
+        localNumber = readLocalNumber()
         readVoiceStatus()
+    }
+
+    private func readLocalNumber() -> String {
+        guard let response = try? command("AT+CNUM") else { return "读取失败" }
+        for line in response.replacingOccurrences(of: "\r", with: "").split(separator: "\n") {
+            let candidates = line.split(separator: "\"", omittingEmptySubsequences: false).map(String.init)
+            if let number = candidates.first(where: { $0.range(of: #"^\+?[0-9][0-9 -]{5,}$"#, options: .regularExpression) != nil }) {
+                return number.replacingOccurrences(of: " ", with: "")
+            }
+        }
+        return "运营商未提供"
     }
 
     private func operatorLabel(_ value: String) -> String {
@@ -893,9 +932,10 @@ final class ModemManager: ObservableObject {
             }
         } else if (upper.contains("+CME ERROR") || upper.contains("+CMS ERROR") || upper.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("ERROR")) && !callEverConnected {
             finishCallFailure("网络拒绝或未建立语音承载", queryCause: true)
-        } else if let status = clccStatus(in: response) {
+        } else if let status = callStatus(in: response) {
             switch status {
             case 0:
+                if !callEverConnected { appendLog("对方已接听，通话已建立") }
                 callEverConnected = true
                 callState = .connected
                 markCallConnected()
@@ -918,6 +958,24 @@ final class ModemManager: ObservableObject {
               let match = regex.firstMatch(in: response, range: NSRange(response.startIndex..., in: response)),
               let range = Range(match.range(at: 1), in: response) else { return nil }
         return Int(response[range])
+    }
+
+    private func callStatus(in response: String) -> Int? {
+        let upper = response.uppercased()
+        if upper.contains("+COLP:") || upper.contains("CONNECT") { return 0 }
+        if let status = clccStatus(in: response) { return status }
+        let patterns = [
+            #"\+QIND:\s*\"ccinfo\",\s*\d+\s*,\s*\d+\s*,\s*(-?\d+)"#,
+            #"\^DSCI:\s*\d+\s*,\s*\d+\s*,\s*(-?\d+)"#
+        ]
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern),
+                  let match = regex.firstMatch(in: response, range: NSRange(response.startIndex..., in: response)),
+                  let range = Range(match.range(at: 1), in: response),
+                  let status = Int(response[range]) else { continue }
+            return status
+        }
+        return nil
     }
 
     private func finishCallFailure(_ reason: String, queryCause: Bool) {
@@ -1058,6 +1116,7 @@ struct DJI4GConnectApp: App {
                 print(try usb.send("AT+COPS?"))
                 print(try usb.send("AT+COPS=3,2"))
                 print(try usb.send("AT+COPS?"))
+                print(try usb.send("AT+CNUM"))
                 _ = try? usb.send("AT+COPS=3,0")
                 print(try usb.send("AT+QCFG=\"ims\""))
                 print(try usb.send("AT+QCFG=\"usbcfg\""))
@@ -1204,6 +1263,7 @@ struct ContentView: View {
 
             VStack(alignment: .leading, spacing: 16) {
                 InfoRow(label: "运营商", value: modem.operatorName, icon: "building.2")
+                InfoRow(label: "本机号码", value: modem.localNumber, icon: "phone")
                 InfoRow(label: "USB 模式", value: modem.usbMode, icon: "arrow.triangle.branch")
                 InfoRow(label: "信号", value: modem.signalText, icon: "cellularbars")
                 InfoRow(label: "USB 网卡", value: modem.network?.device ?? "等待出现", icon: "network")
@@ -1224,7 +1284,7 @@ struct ContentView: View {
             }
         }
         .padding(22)
-        .frame(maxWidth: .infinity, minHeight: 278, alignment: .leading)
+        .frame(maxWidth: .infinity, minHeight: 306, alignment: .leading)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 16))
     }
 
@@ -1340,6 +1400,8 @@ struct ContentView: View {
             featureNotice
         }
         .padding(32)
+        .onAppear { modem.startSMSAutoRefresh() }
+        .onDisappear { modem.stopSMSAutoRefresh() }
     }
 
     private var phoneContent: some View {
