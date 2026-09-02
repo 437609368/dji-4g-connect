@@ -44,7 +44,9 @@ typedef struct {
 } usb_interface;
 
 typedef struct {
-    uint8_t length, descriptor_type, interfaces_count, configuration_value, configuration_string, attributes, max_power;
+    uint8_t length, descriptor_type;
+    uint16_t total_length;
+    uint8_t interfaces_count, configuration_value, configuration_string, attributes, max_power;
     const usb_interface *interfaces;
     const unsigned char *extra;
     int extra_length;
