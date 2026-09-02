@@ -362,8 +362,11 @@ enum SystemNetwork {
         process.standardError = Pipe()
         do {
             try process.run()
+            // Read before waiting so commands with large output (notably
+            // ioreg) cannot fill the pipe and deadlock app startup.
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
-            return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            return String(data: data, encoding: .utf8) ?? ""
         } catch { return "" }
     }
 }
