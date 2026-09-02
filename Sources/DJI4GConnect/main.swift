@@ -263,6 +263,7 @@ enum CallState: Equatable {
 
 enum SystemNetwork {
     static func usbInterface() -> NetworkInterfaceInfo? {
+        guard isBaiwangUSBDevicePresent() else { return nil }
         let output = run("/usr/sbin/networksetup", arguments: ["-listallhardwareports"])
         var label: String?
         var device: String?
@@ -281,6 +282,16 @@ enum SystemNetwork {
             }
         }
         return nil
+    }
+
+    private static func isBaiwangUSBDevicePresent() -> Bool {
+        let output = run("/usr/sbin/ioreg", arguments: ["-p", "IOUSB", "-l", "-w", "0"])
+        guard !output.isEmpty else { return true }
+        let lowercased = output.lowercased()
+        return lowercased.contains("baiwang") ||
+            lowercased.contains("qdc507") ||
+            lowercased.contains("\"idvendor\" = 11388") ||
+            lowercased.contains("\"idvendor\" = 11427")
     }
 
     static func address(for device: String) -> String? {
@@ -446,11 +457,19 @@ final class ModemManager: ObservableObject {
                 if changed { appendLog("发现已连接的 Baiwang USB 网卡：\(found.device)") }
                 startNetworkPolling()
             }
-        } else if state == .connected && channel == nil {
+        } else if state == .connected {
+            channel?.close()
+            channel = nil
             state = .disconnected
             network = nil
             networkTimer?.invalidate()
             networkTimer = nil
+            smsTimer?.invalidate()
+            smsTimer = nil
+            callTimer?.invalidate()
+            callTimer = nil
+            callStartedAt = nil
+            callEverConnected = false
             appendLog("Baiwang USB 网卡已移除")
         }
     }
