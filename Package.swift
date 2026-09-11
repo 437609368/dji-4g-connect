@@ -14,7 +14,9 @@ let package = Package(
             publicHeadersPath: "include",
             linkerSettings: [
                 .linkedFramework("IOKit"),
-                .linkedFramework("CoreFoundation")
+                .linkedFramework("CoreFoundation"),
+                .linkedFramework("CoreAudio"),
+                .linkedFramework("AudioToolbox")
             ]
         )
     ]

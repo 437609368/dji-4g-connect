@@ -24,5 +24,7 @@
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>通话时需要使用 Mac 麦克风，并通过 DJI 4G 模块的 USB 音频通道传输语音。</string>
 </dict>
 </plist>

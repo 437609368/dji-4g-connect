@@ -195,6 +195,7 @@ struct SMSMessage: Identifiable, Equatable {
 }
 
 enum CallOutcome: String, Codable {
+    case incoming
     case dialing
     case connected
     case completed
@@ -203,6 +204,7 @@ enum CallOutcome: String, Codable {
 
     var title: String {
         switch self {
+        case .incoming: return "来电"
         case .dialing: return "呼叫中"
         case .connected: return "已接通"
         case .completed: return "已结束"
@@ -247,13 +249,20 @@ struct SMSHistoryRecord: Identifiable, Codable, Equatable {
 
 enum CallState: Equatable {
     case idle
+    case incoming(String)
     case calling(String)
     case connected
     case failed(String)
 
+    var isIncoming: Bool {
+        if case .incoming = self { return true }
+        return false
+    }
+
     var title: String {
         switch self {
         case .idle: return "未通话"
+        case .incoming(let number): return "来电：" + number
         case .calling(let number): return "正在呼叫 \(number)"
         case .connected: return "通话中"
         case .failed(let reason): return "呼叫失败：\(reason)"
@@ -261,9 +270,40 @@ enum CallState: Equatable {
     }
 }
 
+private struct VoiceCLCCEntry: Equatable {
+    let direction: Int
+    let status: Int
+    let number: String
+}
+
+private func parseVoiceCLCC(_ response: String) -> VoiceCLCCEntry? {
+    for line in response.replacingOccurrences(of: "\r", with: "").split(separator: "\n") {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard trimmed.hasPrefix("+CLCC:") else { continue }
+        let fields = trimmed
+            .replacingOccurrences(of: "+CLCC:", with: "")
+            .split(separator: ",", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "\"")) }
+        guard fields.count >= 4,
+              let direction = Int(fields[1]),
+              let status = Int(fields[2]),
+              let mode = Int(fields[3]),
+              mode == 0 else { continue }
+        return VoiceCLCCEntry(direction: direction, status: status, number: fields.count > 5 ? fields[5] : "")
+    }
+    return nil
+}
+
+private func runCallParserSelfCheck() -> Bool {
+    let dataOnly = "+CLCC: 1,1,0,1,0,\"\",128\r\n+CLCC: 2,1,0,1,0,\"\",128"
+    let mixed = dataOnly + "\r\n+CLCC: 3,1,4,0,0,\"13800138000\",129"
+    return parseVoiceCLCC(dataOnly) == nil &&
+        parseVoiceCLCC(mixed) == VoiceCLCCEntry(direction: 1, status: 4, number: "13800138000")
+}
+
 enum SystemNetwork {
     static func usbInterface() -> NetworkInterfaceInfo? {
-        guard isBaiwangUSBDevicePresent() else { return nil }
+        guard djiUSBDevicePresent() else { return nil }
         let output = run("/usr/sbin/networksetup", arguments: ["-listallhardwareports"])
         var label: String?
         var device: String?
@@ -284,9 +324,9 @@ enum SystemNetwork {
         return nil
     }
 
-    private static func isBaiwangUSBDevicePresent() -> Bool {
+    static func djiUSBDevicePresent() -> Bool {
         let output = run("/usr/sbin/ioreg", arguments: ["-p", "IOUSB", "-l", "-w", "0"])
-        guard !output.isEmpty else { return true }
+        guard !output.isEmpty else { return false }
         let lowercased = output.lowercased()
         return lowercased.contains("baiwang") ||
             lowercased.contains("qdc507") ||
@@ -375,6 +415,7 @@ enum SystemNetwork {
 
 enum ConnectionState: Equatable {
     case disconnected
+    case detected
     case connecting
     case connected
     case error
@@ -382,6 +423,7 @@ enum ConnectionState: Equatable {
     var title: String {
         switch self {
         case .disconnected: return "未连接"
+        case .detected: return "模块已连接"
         case .connecting: return "正在连接"
         case .connected: return "已连接"
         case .error: return "需要处理"
@@ -392,11 +434,15 @@ enum ConnectionState: Equatable {
 @MainActor
 final class ModemManager: ObservableObject {
     @Published var state: ConnectionState = .disconnected
+    @Published var hardwareConnected = false
+    @Published var atConnected = false
     @Published var ports: [String] = []
     @Published var selectedPort = ""
     @Published var apn = UserDefaults.standard.string(forKey: "lastAPN") ?? ""
     @Published var enableECMSwitch = false
     @Published var operatorName = "等待模块"
+    @Published var simStatus = "未读取"
+    @Published var registrationStatus = "未读取"
     @Published var localNumber = "未读取"
     @Published var usbMode = "未读取"
     @Published var signalText = "—"
@@ -413,17 +459,25 @@ final class ModemManager: ObservableObject {
     private var channel: (any ATChannel)?
     private var refreshTimer: Timer?
     private var networkTimer: Timer?
+    private var statusTimer: Timer?
     private var smsTimer: Timer?
     private var callTimer: Timer?
-    private var manuallyDisconnected = false
+    private var dataDisabledByUser = false
     private var lastATAttempt: Date?
     private var callStartedAt: Date?
     private var activeCallRecordID: UUID?
     private var callEverConnected = false
+    private var callPollMisses = 0
+    private var callControlConfigured = false
+    private let callBackend = CallBackend()
+    private let voiceAudio = VoiceAudioBridge()
 
     init() {
         loadHistory()
-        if CommandLine.arguments.contains("--probe-at") { return }
+        if CommandLine.arguments.contains("--probe-at") || CommandLine.arguments.contains("--self-check") { return }
+        if SystemNetwork.djiUSBDevicePresent() {
+            startCallBackendIfNeeded()
+        }
         refreshDevices()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refreshDevices() }
@@ -432,6 +486,29 @@ final class ModemManager: ObservableObject {
 
     var isConnected: Bool { state == .connected }
 
+    private func startCallBackendIfNeeded() {
+        do {
+            if callBackend.isRunning,
+               let mode = try? callBackend.request("api/call-mode/status", timeout: 6),
+               mode["state"] as? String == "disconnected" {
+                callBackend.stop()
+            }
+            if !callBackend.isRunning {
+                try callBackend.start()
+                appendLog("已启动 QDC507 通话后端")
+            }
+        } catch {
+            appendLog("通话后端未启动，将使用基础 AT 模式：\(error.localizedDescription)")
+        }
+    }
+
+    private var callIsActive: Bool {
+        switch callState {
+        case .idle, .failed: return false
+        case .incoming, .calling, .connected: return true
+        }
+    }
+
     func refreshPorts() {
         refreshDevices()
     }
@@ -439,64 +516,79 @@ final class ModemManager: ObservableObject {
     private func refreshDevices() {
         ports = PortScanner.allPorts()
         if !ports.contains(selectedPort) { selectedPort = ports.first ?? "" }
-        guard !manuallyDisconnected else {
-            if SystemNetwork.usbInterface() == nil { manuallyDisconnected = false }
+        guard SystemNetwork.djiUSBDevicePresent() else {
+            guard hardwareConnected || state != .disconnected else { return }
+            hardwareConnected = false
+            atConnected = false
+            channel?.close()
+            channel = nil
+            state = .disconnected
+            network = nil
+            dataDisabledByUser = false
+            networkTimer?.invalidate()
+            networkTimer = nil
+            statusTimer?.invalidate()
+            statusTimer = nil
+            smsTimer?.invalidate()
+            smsTimer = nil
+            if activeCallRecordID != nil { finishActiveCall(outcome: .cancelled) }
+            resetCallRuntime()
+            callState = .idle
+            callControlConfigured = false
+            appendLog("DJI/Baiwang 模块已移除")
+            return
+        }
+
+        if !hardwareConnected {
+            startCallBackendIfNeeded()
+            hardwareConnected = true
+            state = .detected
+            errorMessage = ""
+            appendLog("检测到 DJI/Baiwang 4G 模块")
+        }
+
+        if channel == nil && (lastATAttempt == nil || Date().timeIntervalSince(lastATAttempt!) > 5) {
+            openATIfAvailable()
+        }
+
+        if dataDisabledByUser {
+            network = nil
+            if state != .connecting && state != .error { state = .detected }
             return
         }
 
         if let found = SystemNetwork.usbInterface() {
             let changed = network != found
             network = found
-            if channel == nil {
-                operatorName = "需 AT 接口"
-                usbMode = "ECM"
-                if lastATAttempt == nil || Date().timeIntervalSince(lastATAttempt!) > 5 {
-                    openATIfAvailable()
-                }
-            }
-            if state == .disconnected || state == .error {
+            if found.address != nil {
                 state = .connected
-                errorMessage = ""
-                if changed { appendLog("发现已连接的 Baiwang USB 网卡：\(found.device)") }
-                startNetworkPolling()
+            } else if state != .connecting && state != .error {
+                state = .detected
             }
+            if changed { appendLog("发现 Baiwang USB 网卡：\(found.device)") }
+            startNetworkPolling()
         } else if state == .connected {
-            channel?.close()
-            channel = nil
-            state = .disconnected
             network = nil
+            state = .detected
             networkTimer?.invalidate()
             networkTimer = nil
-            smsTimer?.invalidate()
-            smsTimer = nil
-            callTimer?.invalidate()
-            callTimer = nil
-            callStartedAt = nil
-            callEverConnected = false
-            appendLog("Baiwang USB 网卡已移除")
+            appendLog("模块仍已连接，但 macOS 暂未启用 Baiwang 网络服务")
         }
     }
 
     func connect() {
-        manuallyDisconnected = false
+        dataDisabledByUser = false
         state = .connecting
         errorMessage = ""
-        appendLog("开始连接模块")
+        appendLog("开始启用 4G 网络")
         do {
+            guard hardwareConnected || SystemNetwork.djiUSBDevicePresent() else {
+                throw ModemError.noSerialPort
+            }
             if SystemNetwork.setUSBNetworkServicesEnabled(true) {
                 appendLog("已启用 Baiwang USB 网络服务")
             }
-            if channel == nil {
-                if !selectedPort.isEmpty {
-                    let serial = SerialPort(path: selectedPort)
-                    try serial.open()
-                    channel = serial
-                    appendLog("使用 AT 串口：\(selectedPort)")
-                } else {
-                    channel = try USBATPort()
-                    appendLog("使用模块原生 USB AT 接口")
-                }
-            }
+            if channel == nil { openATIfAvailable() }
             guard channel != nil else { throw ModemError.noSerialPort }
 
             let identity = try command("ATI")
@@ -518,9 +610,10 @@ final class ModemManager: ObservableObject {
                 _ = try command("AT+CFUN=1,1", timeout: 2)
                 channel?.close()
                 channel = nil
+                atConnected = false
+                callControlConfigured = false
                 appendLog("模块正在重新枚举，请等待 USB 网卡出现")
             } else {
-                _ = try command("AT+CFUN=1")
                 readModuleStatus()
             }
 
@@ -534,44 +627,48 @@ final class ModemManager: ObservableObject {
                 }
                 if let ready {
                     network = ready
+                    state = .connected
                     appendLog("USB 网卡 \(interfaceInfo.device) 已获取地址 \(ready.address ?? "")")
                 } else {
+                    state = .detected
+                    errorMessage = "Baiwang 网卡已出现，但 DHCP 尚未获取 IP。请再次点击启用 4G 网络。"
                     appendLog("USB 网卡 \(interfaceInfo.device) 已发现，但 DHCP 尚未获取地址")
                 }
             } else {
+                state = .detected
+                errorMessage = "模块已识别，但 macOS 尚未创建 Baiwang 网卡。"
                 appendLog("模块已配置，等待 macOS 创建 USB 网卡")
             }
-            state = .connected
             startNetworkPolling()
-            appendLog("连接成功，可以开始使用 4G 网络")
+            startSMSAutoRefresh()
+            appendLog(state == .connected ? "4G 网络已就绪" : "模块已就绪，等待网络地址")
         } catch {
-            channel?.close()
-            channel = nil
+            atConnected = channel != nil
+            hardwareConnected = SystemNetwork.djiUSBDevicePresent()
             fail(error.localizedDescription)
         }
     }
 
     func disconnect() {
-        manuallyDisconnected = true
+        dataDisabledByUser = true
         networkTimer?.invalidate()
         networkTimer = nil
-        smsTimer?.invalidate()
-        smsTimer = nil
         callTimer?.invalidate()
         callTimer = nil
         if let channel {
             _ = try? channel.send("AT+CGACT=0,1", timeout: 0.5)
-            channel.close()
         }
-        self.channel = nil
+        let serviceDisabled = SystemNetwork.setUSBNetworkServicesEnabled(false)
         network = nil
-        state = .disconnected
-        if activeCallRecordID != nil {
-            finishActiveCall(outcome: .cancelled)
-        }
+        state = hardwareConnected ? .detected : .disconnected
+            if activeCallRecordID != nil {
+                finishActiveCall(outcome: .cancelled)
+            }
+        resetCallRuntime()
         callState = .idle
-        appendLog("已断开 Baiwang 4G 数据连接")
-        appendLog("已保留 Baiwang 网络服务，方便下次直接重连；Wi-Fi 等其他网络不会受影响")
+        appendLog("已关闭 Baiwang 4G 数据连接")
+        appendLog(serviceDisabled ? "已停用 macOS Baiwang 网络服务" : "未找到可停用的 Baiwang 网络服务，系统可能仍保留原有路由")
+        appendLog("模块仍保持可识别，短信/AT 状态可继续读取；再次点击即可启用网络")
     }
 
     func clearLogs() { logs.removeAll() }
@@ -581,7 +678,10 @@ final class ModemManager: ObservableObject {
         smsTimer = nil
         loadMessages(silent: true)
         smsTimer = Timer.scheduledTimer(withTimeInterval: 12, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.loadMessages(silent: true) }
+            Task { @MainActor in
+                guard let self, !self.callIsActive else { return }
+                self.loadMessages(silent: true)
+            }
         }
     }
 
@@ -590,8 +690,29 @@ final class ModemManager: ObservableObject {
         smsTimer = nil
     }
 
+    private func startStatusPolling() {
+        statusTimer?.invalidate()
+        statusTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.channel != nil, !self.callIsActive else { return }
+                self.readModuleStatus(silent: true)
+            }
+        }
+    }
+
     private func openATIfAvailable() {
         lastATAttempt = Date()
+        if callBackend.isRunning {
+            channel = BackendATChannel(backend: callBackend)
+            atConnected = true
+            appendLog("已通过通话后端打开 AT 接口")
+            readModuleStatus()
+            configureCallNotifications()
+            startCallPolling()
+            startStatusPolling()
+            startSMSAutoRefresh()
+            return
+        }
         var serialError: String?
         do {
             if !selectedPort.isEmpty {
@@ -602,26 +723,39 @@ final class ModemManager: ObservableObject {
                     throw ModemError.commandFailed("串口没有返回 OK")
                 }
                 channel = serial
+                atConnected = true
                 appendLog("已打开 AT 串口：\(selectedPort)")
             } else {
                 channel = try USBATPort()
+                atConnected = true
                 appendLog("已通过 USB 直连打开 AT 接口")
             }
             readModuleStatus()
+            configureCallNotifications()
+            startCallPolling()
+            startStatusPolling()
+            startSMSAutoRefresh()
             return
         } catch {
             serialError = error.localizedDescription
             channel?.close()
             channel = nil
+            atConnected = false
         }
 
         // ECM 模式通常不会创建 /dev/cu.*；即使系统没有串口，也尝试
         // 通过模块的 USB bulk AT 接口读取 COPS/CSQ、短信和电话状态。
         do {
             channel = try USBATPort()
+            atConnected = true
             appendLog("已通过 USB 直连打开 AT 接口")
             readModuleStatus()
+            configureCallNotifications()
+            startCallPolling()
+            startStatusPolling()
+            startSMSAutoRefresh()
         } catch {
+            atConnected = false
             operatorName = "需 AT 接口"
             let detail = serialError.map { "串口：\($0)；USB：\(error.localizedDescription)" } ?? error.localizedDescription
             appendLog("AT 接口暂不可用：\(detail)")
@@ -663,30 +797,103 @@ final class ModemManager: ObservableObject {
         let value = number.trimmingCharacters(in: .whitespacesAndNewlines)
         guard value.range(of: "^[+0-9*#()-]+$", options: .regularExpression) != nil else { fail("请输入有效的电话号码"); return }
         guard channel != nil else { fail("拨打电话需要 AT 接口；当前 USB AT 通道不可用。"); return }
+        guard reconcileCallStateBeforeNewCall() else { fail("模块仍报告有活动通话，请先挂断"); return }
+        errorMessage = ""
         do {
-            _ = try? command("AT+CLIP=1")
-            _ = try? command("AT+COLP=1")
-            _ = try? command("AT+QINDCFG=\"ccinfo\",1")
-            _ = try? command("AT+QINDCFG=\"all\",1")
-            _ = try command("ATD\(value);")
+            if callBackend.isRunning {
+                let mode = try callBackend.request("api/call-mode/status", timeout: 12)
+                guard mode["state"] as? String == "ready" else {
+                    throw CallBackendError.request(mode["summary"] as? String ?? "通话模式尚未就绪")
+                }
+                _ = try callBackend.request("api/call/dial", method: "POST", body: ["number": value], timeout: 15)
+                callState = .calling(value)
+                callEverConnected = false
+                callPollMisses = 0
+                callStartedAt = Date()
+                startCallRecord(number: value)
+                appendLog("已发起语音呼叫：\(value)")
+                startCallPolling()
+                return
+            }
+            configureCallNotifications()
+            let response = try command("ATD\(value);", timeout: 8)
+            let upper = response.uppercased()
+            if upper.contains("NO CARRIER") || upper.contains("BUSY") || upper.contains("NO DIALTONE") || upper.contains("NO ANSWER") {
+                throw ModemError.commandFailed(response)
+            }
             callState = .calling(value)
             callEverConnected = false
+            callPollMisses = 0
             callStartedAt = Date()
             startCallRecord(number: value)
-            appendLog("正在呼叫 \(value)")
+            appendLog("已发送 ATD，等待模块返回真实通话状态：\(value)")
+            startCallPolling()
+        } catch { fail(error.localizedDescription) }
+    }
+
+    func answerCall() {
+        guard channel != nil else { fail("接听电话需要 AT 接口；当前 USB AT 通道不可用。"); return }
+        let number: String
+        if case .incoming(let incomingNumber) = callState {
+            number = incomingNumber
+        } else {
+            // Manual fallback: ATA is safe to try when the modem reported a
+            // call in the log but its URC format was not recognized.
+            number = "未知号码"
+        }
+        errorMessage = ""
+        do {
+            if callBackend.isRunning {
+                let mode = try callBackend.request("api/call-mode/status", timeout: 12)
+                guard mode["state"] as? String == "ready" else {
+                    throw CallBackendError.request(mode["summary"] as? String ?? "通话模式尚未就绪")
+                }
+                _ = try callBackend.request("api/call/answer", method: "POST", timeout: 15)
+                callState = .calling(number)
+                callEverConnected = false
+                callPollMisses = 0
+                callStartedAt = Date()
+                appendLog("已接听来电：" + number)
+                startCallPolling()
+                return
+            }
+            configureCallNotifications()
+            let response = try command("ATA", timeout: 8)
+            if response.uppercased().contains("NO CARRIER") || response.uppercased().contains("BUSY") {
+                throw ModemError.commandFailed(response)
+            }
+            callState = .calling(number)
+            callEverConnected = false
+            callPollMisses = 0
+            callStartedAt = Date()
+            appendLog("已发送 ATA，等待模块确认接通：" + number)
             startCallPolling()
         } catch { fail(error.localizedDescription) }
     }
 
     func hangUp() {
-        guard channel != nil else { callState = .idle; return }
-        do {
-            _ = try command("ATH")
-            finishActiveCall(outcome: callEverConnected || callState == .connected ? .completed : .cancelled)
+        if callBackend.isRunning {
+            do {
+                voiceAudio.stop()
+                _ = try callBackend.request("api/call/hangup", method: "POST", timeout: 20)
+                finishActiveCall(outcome: callEverConnected || callState == .connected ? .completed : .cancelled)
+                resetCallRuntime()
+                callState = .idle
+                appendLog("通话已结束")
+            } catch { fail(error.localizedDescription) }
+            return
+        }
+        guard channel != nil else {
+            finishActiveCall(outcome: callEverConnected ? .completed : .cancelled)
+            resetCallRuntime()
             callState = .idle
-            callTimer?.invalidate()
-            callTimer = nil
-            callStartedAt = nil
+            return
+        }
+        do {
+            _ = try command("ATH", timeout: 3)
+            finishActiveCall(outcome: callEverConnected || callState == .connected ? .completed : .cancelled)
+            resetCallRuntime()
+            callState = .idle
             appendLog("通话已结束")
         } catch { fail(error.localizedDescription) }
     }
@@ -766,21 +973,21 @@ final class ModemManager: ObservableObject {
         saveHistory()
     }
 
-    private func command(_ text: String, timeout: TimeInterval = 1.2) throws -> String {
-        appendLog("> \(text)")
+    private func command(_ text: String, timeout: TimeInterval = 1.2, log: Bool = true) throws -> String {
+        if log { appendLog("> \(text)") }
         let result = try channel?.send(text, timeout: timeout) ?? ""
         if result.uppercased().contains("ERROR") { throw ModemError.commandFailed(result) }
         let visible = result.replacingOccurrences(of: "\r", with: "").replacingOccurrences(of: "\n", with: " ")
-        if !visible.isEmpty { appendLog(visible) }
+        if log && !visible.isEmpty { appendLog(visible) }
         return result
     }
 
-    private func readModuleStatus() {
-        if let signal = try? command("AT+CSQ"), let match = signal.range(of: #"\+CSQ:\s*(\d+)"#, options: .regularExpression) {
+    private func readModuleStatus(silent: Bool = false) {
+        if let signal = try? command("AT+CSQ", log: !silent), let match = signal.range(of: #"\+CSQ:\s*(\d+)"#, options: .regularExpression) {
             let value = signal[match].split(separator: ":").last?.trimmingCharacters(in: .whitespaces).split(separator: ",").first ?? "—"
             signalText = value == "99" ? "未知" : "\(value) / 31"
         }
-        if let cops = try? command("AT+COPS?") {
+        if let cops = try? command("AT+COPS?", log: !silent) {
             let name = cops.split(separator: "\"").dropFirst().first.map(String.init)
             if let name, !name.isEmpty, !name.contains("?") {
                 operatorName = operatorLabel(name)
@@ -794,20 +1001,22 @@ final class ModemManager: ObservableObject {
             // question marks. Ask for MCC/MNC instead, then restore the
             // human-readable format for other modem clients.
             if name == nil || name?.contains("?") == true {
-                _ = try? command("AT+COPS=3,2")
-                if let numeric = try? command("AT+COPS?"),
+                _ = try? command("AT+COPS=3,2", log: !silent)
+                if let numeric = try? command("AT+COPS?", log: !silent),
                    let code = numeric.split(separator: "\"").dropFirst().first.map(String.init) {
                     operatorName = operatorLabel(code)
                 }
-                _ = try? command("AT+COPS=3,0")
+                _ = try? command("AT+COPS=3,0", log: !silent)
             }
         }
-        localNumber = readLocalNumber()
-        readVoiceStatus()
+        localNumber = readLocalNumber(log: !silent)
+        simStatus = readSIMStatus(log: !silent)
+        registrationStatus = readRegistrationStatus(log: !silent)
+        readVoiceStatus(log: !silent)
     }
 
-    private func readLocalNumber() -> String {
-        guard let response = try? command("AT+CNUM") else { return "读取失败" }
+    private func readLocalNumber(log: Bool = true) -> String {
+        guard let response = try? command("AT+CNUM", log: log) else { return "读取失败" }
         for line in response.replacingOccurrences(of: "\r", with: "").split(separator: "\n") {
             let candidates = line.split(separator: "\"", omittingEmptySubsequences: false).map(String.init)
             if let number = candidates.first(where: { $0.range(of: #"^\+?[0-9][0-9 -]{5,}$"#, options: .regularExpression) != nil }) {
@@ -815,6 +1024,29 @@ final class ModemManager: ObservableObject {
             }
         }
         return "运营商未提供"
+    }
+
+    private func readSIMStatus(log: Bool = true) -> String {
+        guard let response = try? command("AT+CPIN?", log: log) else { return "读取失败" }
+        if response.contains("READY") { return "SIM 已就绪" }
+        if response.contains("SIM PIN") { return "需要 SIM PIN" }
+        if response.contains("NOT INSERTED") { return "未插入 SIM" }
+        return firstMeaningfulLine(response)
+    }
+
+    private func readRegistrationStatus(log: Bool = true) -> String {
+        guard let response = try? command("AT+CEREG?", log: log),
+              let line = response.split(whereSeparator: \.isNewline).first(where: { $0.contains("+CEREG:") }) else {
+            return "读取失败"
+        }
+        let status = line.split(separator: ",").last.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
+        switch status {
+        case "1": return "已注册（本地）"
+        case "5": return "已注册（漫游）"
+        case "2": return "正在搜索网络"
+        case "3": return "注册被拒绝"
+        default: return "未注册"
+        }
     }
 
     private func operatorLabel(_ value: String) -> String {
@@ -829,9 +1061,15 @@ final class ModemManager: ObservableObject {
         return value
     }
 
-    private func readVoiceStatus() {
-        let ims = (try? command("AT+QCFG=\"ims\"")) ?? ""
-        let usb = (try? command("AT+QCFG=\"usbcfg\"")) ?? ""
+    private func readVoiceStatus(log: Bool = true) {
+        if callBackend.isRunning, let mode = try? callBackend.request("api/call-mode/status", timeout: 12) {
+            let state = mode["state"] as? String ?? "unknown"
+            let summary = mode["summary"] as? String ?? "通话模式未知"
+            voiceStatus = state == "ready" ? "IMS 已开启 · USB 音频已启用 · 语音运行时已就绪" : summary
+            return
+        }
+        let ims = (try? command("AT+QCFG=\"ims\"", log: log)) ?? ""
+        let usb = (try? command("AT+QCFG=\"usbcfg\"", log: log)) ?? ""
         let pcm = channel.flatMap { try? $0.send("AT+QPCMV?", timeout: 0.8) } ?? ""
         let imsEnabled = ims.range(of: #"\+QCFG:\s*"ims",\s*1(?:\s|,|$)"#, options: .regularExpression) != nil
         let usbLine = usb.split(whereSeparator: \.isNewline).first(where: { $0.contains("+QCFG:") }).map(String.init) ?? ""
@@ -843,11 +1081,23 @@ final class ModemManager: ObservableObject {
         if pcm.isEmpty {
             pcmText = "媒体路由未读取"
         } else if pcm.uppercased().contains("ERROR") {
-            pcmText = "媒体路由不支持"
+            pcmText = "缺少模块语音运行时"
         } else {
             pcmText = "媒体路由已提供"
         }
         voiceStatus = "\(imsText) · \(uacText) · \(pcmText)"
+    }
+
+    private func configureCallNotifications() {
+        guard !callControlConfigured else { return }
+        _ = try? command("ATE0")
+        _ = try? command("AT+CLIP=1")
+        _ = try? command("AT+CRC=1")
+        _ = try? command("AT+COLP=1")
+        _ = try? command("AT+CVHU=0")
+        _ = try? command("AT+QINDCFG=\"ccinfo\",1")
+        _ = try? command("AT^DSCI=1")
+        callControlConfigured = true
     }
 
     private func automaticAPN() -> String? {
@@ -898,10 +1148,11 @@ final class ModemManager: ObservableObject {
             let commandText = "AT+QCFG=\"usbcfg\",\(target.joined(separator: ","))"
             _ = try command(commandText)
             _ = try command("AT+QCFG=\"ims\",1")
-            appendLog("已启用 IMS 和 USB 音频接口，模块将重启")
+            appendLog("已启用 IMS 和 USB 音频接口，模块将重启；通话音频仍需模块语音运行时")
             _ = try? command("AT+CFUN=1,1", timeout: 2)
             channel?.close()
             channel = nil
+            callControlConfigured = false
             callState = .idle
             callStartedAt = nil
             voiceStatus = "已应用，等待模块重新枚举"
@@ -920,84 +1171,208 @@ final class ModemManager: ObservableObject {
     }
 
     private func pollCallState() {
-        guard let channel else {
-            // Some QDC507 firmware briefly drops the AT response channel when
-            // the voice bearer is being established. Do not turn an already
-            // connected call into a false failure in that window.
-            if !callEverConnected {
-                finishCallFailure("AT 通道已断开", queryCause: false)
-            }
+        if callBackend.isRunning {
+            pollBackendCallState()
             return
         }
+        guard let channel else { return }
         let elapsed = callStartedAt.map { Date().timeIntervalSince($0) } ?? 0
-        guard let response = try? channel.send("AT+CLCC", timeout: 0.8) else {
-            if !callEverConnected, elapsed > 30 {
+        let clccResponse = try? channel.send("AT+CLCC", timeout: 0.8)
+        let cpasResponse = callState == .idle || callState.isIncoming
+            ? try? channel.send("AT+CPAS", timeout: 0.8)
+            : nil
+        let response = [clccResponse, cpasResponse].compactMap { $0 }.joined(separator: "\n")
+        guard !response.isEmpty else {
+            guard callIsActive else { return }
+            callPollMisses += 1
+            if callPollMisses >= 3, !callEverConnected, elapsed > 30 {
                 finishCallFailure("呼叫超时，模块未返回通话状态", queryCause: true)
             }
             return
         }
         let upper = response.uppercased()
+        if let number = incomingCallNumber(in: response) {
+            callPollMisses = 0
+            presentIncomingCall(number: number)
+            return
+        }
         if upper.contains("BUSY") && !callEverConnected {
             finishCallFailure("对方占线", queryCause: true)
-        } else if upper.contains("NO ANSWER") && !callEverConnected {
+            return
+        }
+        if upper.contains("NO ANSWER") && !callEverConnected {
             finishCallFailure("对方未接听", queryCause: true)
-        } else if upper.contains("NO CARRIER") {
-            if callEverConnected {
-                finishActiveCall(outcome: .completed)
-                callState = .idle
-                callTimer?.invalidate()
-                callTimer = nil
-                callStartedAt = nil
-                appendLog("通话已结束（模块返回 NO CARRIER）")
-            } else {
-                finishCallFailure("网络拒绝或未建立语音承载", queryCause: true)
-            }
-        } else if (upper.contains("+CME ERROR") || upper.contains("+CMS ERROR") || upper.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("ERROR")) && !callEverConnected {
+            return
+        }
+        if upper.contains("NO CARRIER") {
+            finishCallFromModem("模块返回 NO CARRIER")
+            return
+        }
+        if (clccResponse?.uppercased().contains("+CME ERROR") == true || clccResponse?.uppercased().contains("+CMS ERROR") == true) && !callEverConnected {
             finishCallFailure("网络拒绝或未建立语音承载", queryCause: true)
-        } else if let status = callStatus(in: response) {
-            switch status {
+            return
+        }
+
+        if let entry = clccEntry(in: response) {
+            callPollMisses = 0
+            switch entry.status {
             case 0:
-                if !callEverConnected { appendLog("对方已接听，通话已建立") }
+                if !callEverConnected { appendLog("模块确认通话已接通") }
                 callEverConnected = true
                 callState = .connected
                 markCallConnected()
-            case 2, 3:
-                if case .calling = callState { return }
-                callState = .calling("通话建立中")
+            case 1:
+                callState = .calling("通话保持中")
+            case 2:
+                callState = .calling("正在拨号")
+            case 3:
+                callState = .calling("等待对方接听")
+            case 4, 5:
+                let number = entry.number.isEmpty ? "未知号码" : entry.number
+                presentIncomingCall(number: number)
             default:
-                if elapsed > 30 { finishCallFailure("呼叫超时，未接通", queryCause: true) }
+                if elapsed > 30, !callEverConnected { finishCallFailure("呼叫超时，未接通", queryCause: true) }
             }
-        } else if elapsed > 30 {
-            if !callEverConnected {
-                finishCallFailure("呼叫超时，模块未建立语音承载", queryCause: true)
+            return
+        }
+
+        if let status = cpasStatus(in: cpasResponse ?? "") {
+            switch status {
+            case 3:
+                callPollMisses = 0
+                presentIncomingCall(number: incomingCallNumber(in: response) ?? "未知号码")
+                return
+            case 4:
+                callPollMisses = 0
+                // QDC507 may report CPAS=4 for its packet-data session.
+                // Only CLCC/DSCI/RING may create a voice-call state.
+                return
+            default:
+                break
+            }
+        }
+
+        if let status = callStatus(in: response) {
+            callPollMisses = 0
+            switch status {
+            case 0:
+                if !callEverConnected { appendLog("模块确认通话已接通") }
+                callEverConnected = true
+                callState = .connected
+                markCallConnected()
+            case 2:
+                callState = .calling("正在拨号")
+            case 3:
+                callState = .calling("等待对方接听")
+            case 4, 5:
+                presentIncomingCall(number: "未知号码")
+            default:
+                if elapsed > 30, !callEverConnected { finishCallFailure("呼叫超时，未接通", queryCause: true) }
+            }
+            return
+        }
+
+        // DJOneHub treats NO CARRIER/BUSY/NO ANSWER as the release events.
+        // Some QDC507 firmware returns an empty CLCC list while the call is
+        // still being connected, so an empty poll must never hang up a call.
+        // Keep the state until an explicit modem release or a real timeout.
+        if callIsActive {
+            callPollMisses += 1
+            if callEverConnected, callPollMisses >= 2 {
+                finishCallFromModem("模块不再报告语音通话")
+                return
+            }
+            if callPollMisses >= 10, !callEverConnected, elapsed > 60 {
+                finishCallFailure("模块长时间未确认通话状态", queryCause: true)
             }
         }
     }
 
     private func clccStatus(in response: String) -> Int? {
-        let pattern = #"\+CLCC:\s*\d+\s*,\s*\d+\s*,\s*(\d+)"#
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(in: response, range: NSRange(response.startIndex..., in: response)),
-              let range = Range(match.range(at: 1), in: response) else { return nil }
-        return Int(response[range])
+        clccEntry(in: response)?.status
+    }
+
+    private func cpasStatus(in response: String) -> Int? {
+        guard let match = response.range(of: #"\+CPAS:\s*(\d+)"#, options: .regularExpression) else { return nil }
+        let value = response[match].split(separator: ":").last?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return Int(value)
+    }
+
+    private func clccEntry(in response: String) -> (direction: Int, status: Int, number: String)? {
+        guard let entry = parseVoiceCLCC(response) else { return nil }
+        return (entry.direction, entry.status, entry.number)
+    }
+
+    private func dsciEntry(in response: String) -> (direction: Int, status: Int, number: String)? {
+        guard let line = response.replacingOccurrences(of: "\r", with: "")
+            .split(separator: "\n")
+            .first(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("^DSCI:") }) else { return nil }
+        let fields = line
+            .replacingOccurrences(of: "^DSCI:", with: "")
+            .split(separator: ",", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "\"")) }
+        guard fields.count >= 5, let direction = Int(fields[1]), let status = Int(fields[2]) else { return nil }
+        return (direction, status, fields[4])
+    }
+
+    private func incomingCallNumber(in response: String) -> String? {
+        let dsci = dsciEntry(in: response)
+        let hasRing = response.range(of: #"(^|\n)\s*(\+CRING:|RING)"#, options: .regularExpression) != nil
+        let hasClip = response.range(of: #"(^|\n)\s*\+CLIP:"#, options: .regularExpression) != nil
+        let isIncomingDSCI = dsci?.direction == 1 && (dsci?.status == 4 || dsci?.status == 5)
+        let isIncomingCLCC = clccEntry(in: response).map { $0.direction == 1 && ($0.status == 4 || $0.status == 5) } == true
+        guard hasRing || hasClip || isIncomingDSCI || isIncomingCLCC else { return nil }
+
+        if let line = response.replacingOccurrences(of: "\r", with: "")
+            .split(separator: "\n")
+            .first(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("+CLIP:") }) {
+            let value = line
+                .replacingOccurrences(of: "+CLIP:", with: "")
+                .split(separator: ",", maxSplits: 1, omittingEmptySubsequences: false)
+                .first
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "\"")) } ?? ""
+            if !value.isEmpty { return value }
+        }
+        if let number = dsci?.number, !number.isEmpty { return number }
+        if let number = clccEntry(in: response)?.number, !number.isEmpty { return number }
+        return "未知号码"
+    }
+
+    private func presentIncomingCall(number: String) {
+        guard !callEverConnected else { return }
+        if case .incoming = callState { return }
+        callPollMisses = 0
+        callState = .incoming(number)
+        callStartedAt = Date()
+        startIncomingCallRecord(number: number)
+        appendLog("收到来电：" + number + "，请点击接听")
     }
 
     private func callStatus(in response: String) -> Int? {
         let upper = response.uppercased()
-        if upper.contains("+COLP:") || upper.contains("CONNECT") { return 0 }
+        if upper.contains("+COLP:") || (upper.contains("CONNECT") && !upper.contains("NO CONNECT")) { return 0 }
         if let status = clccStatus(in: response) { return status }
-        let patterns = [
-            #"\+QIND:\s*\"ccinfo\",\s*\d+\s*,\s*\d+\s*,\s*(-?\d+)"#,
-            #"\^DSCI:\s*\d+\s*,\s*\d+\s*,\s*(-?\d+)"#
-        ]
-        for pattern in patterns {
-            guard let regex = try? NSRegularExpression(pattern: pattern),
-                  let match = regex.firstMatch(in: response, range: NSRange(response.startIndex..., in: response)),
-                  let range = Range(match.range(at: 1), in: response),
-                  let status = Int(response[range]) else { continue }
-            return status
+        return dsciEntry(in: response)?.status
+    }
+
+    private func reconcileCallStateBeforeNewCall() -> Bool {
+        if case .failed = callState {
+            finishActiveCall(outcome: .failed)
+            resetCallRuntime()
+            callState = .idle
+            return true
         }
-        return nil
+        guard callIsActive else { return true }
+        guard let channel, let response = try? channel.send("AT+CLCC", timeout: 1.2) else { return false }
+        let activeCLCC = clccEntry(in: response) != nil
+        let activeDSCI = dsciEntry(in: response).map { 0...5 ~= $0.status } == true
+        let hasRing = incomingCallNumber(in: response) != nil
+        guard !activeCLCC && !activeDSCI && !hasRing else { return false }
+        finishActiveCall(outcome: .cancelled)
+        resetCallRuntime()
+        callState = .idle
+        appendLog("拨号前校验：模块无活动通话，已清理旧状态")
+        return true
     }
 
     private func finishCallFailure(_ reason: String, queryCause: Bool) {
@@ -1006,11 +1381,83 @@ final class ModemManager: ObservableObject {
             if !visible.isEmpty { appendLog("通话原因：\(visible)") }
         }
         finishActiveCall(outcome: .failed)
+        resetCallRuntime()
         callState = .failed(reason)
+        appendLog("呼叫失败：\(reason)")
+    }
+
+    private func finishCallFromModem(_ reason: String) {
+        let outcome: CallOutcome = callEverConnected ? .completed : (callState.isIncoming ? .cancelled : .failed)
+        finishActiveCall(outcome: outcome)
+        resetCallRuntime()
+        callState = .idle
+        appendLog("通话已结束（\(reason)）")
+    }
+
+    private func resetCallRuntime() {
         callTimer?.invalidate()
         callTimer = nil
+        if voiceAudio.isRunning {
+            voiceAudio.stop()
+            _ = try? callBackend.request("api/call/audio/stop", method: "POST", timeout: 20)
+        }
         callStartedAt = nil
-        appendLog("呼叫失败：\(reason)")
+        callEverConnected = false
+        callPollMisses = 0
+        if channel != nil, hardwareConnected, !dataDisabledByUser {
+            startCallPolling()
+        }
+    }
+
+    private func pollBackendCallState() {
+        guard let status = try? callBackend.request("api/call/status", timeout: 6),
+              let state = status["state"] as? String else { return }
+        let number = (status["number"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "未知号码"
+        switch state {
+        case "incoming":
+            presentIncomingCall(number: number)
+        case "dialing":
+            callState = .calling("正在拨号")
+        case "alerting":
+            callState = .calling("等待对方接听")
+        case "active":
+            if !callEverConnected {
+                callEverConnected = true
+                callState = .connected
+                markCallConnected()
+                appendLog("模块确认通话已接通，正在启动语音路由")
+                startBackendVoiceAudio()
+            }
+        case "idle":
+            if callIsActive {
+                finishCallFromModem("模块报告通话结束")
+            }
+        default:
+            break
+        }
+    }
+
+    private func startBackendVoiceAudio() {
+        do {
+            let result = try callBackend.request("api/call/audio/start", method: "POST", timeout: 60)
+            guard result["started"] as? Bool == true else {
+                throw CallBackendError.request("模块没有确认语音路由")
+            }
+            if let error = voiceAudio.start() {
+                _ = try? callBackend.request("api/call/audio/stop", method: "POST", timeout: 20)
+                throw CallBackendError.request(error)
+            }
+            appendLog("通话音频已连接 Mac 麦克风和扬声器")
+        } catch {
+            appendLog("通话已接通，但音频启动失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func startIncomingCallRecord(number: String) {
+        let record = CallRecord(id: UUID(), number: number, startedAt: Date(), endedAt: nil, outcome: .incoming)
+        activeCallRecordID = record.id
+        callHistory.insert(record, at: 0)
+        saveHistory()
     }
 
     private func waitForNetworkInterface() -> NetworkInterfaceInfo? {
@@ -1036,11 +1483,14 @@ final class ModemManager: ObservableObject {
         _ = try? channel.send("AT+CFUN=1,1", timeout: 2)
         channel.close()
         self.channel = nil
+        atConnected = false
+        callControlConfigured = false
 
         for _ in 0..<30 {
             RunLoop.current.run(until: Date().addingTimeInterval(0.5))
             if let usb = try? USBATPort() {
                 self.channel = usb
+                self.atConnected = true
                 break
             }
         }
@@ -1126,11 +1576,18 @@ final class ModemManager: ObservableObject {
 
 // MARK: - UI
 
-@main
 struct DJI4GConnectApp: App {
     @StateObject private var modem = ModemManager()
 
     init() {
+        if CommandLine.arguments.contains("--self-check") {
+            guard runCallParserSelfCheck() else {
+                fputs("call parser self-check failed\n", stderr)
+                Darwin.exit(1)
+            }
+            print("call parser self-check passed")
+            Darwin.exit(0)
+        }
         if CommandLine.arguments.contains("--probe-at") {
             do {
                 let usb = try USBATPort()
@@ -1143,6 +1600,11 @@ struct DJI4GConnectApp: App {
                 print(try usb.send("AT+QCFG=\"ims\""))
                 print(try usb.send("AT+QCFG=\"usbcfg\""))
                 print(try usb.send("AT+QPCMV?"))
+                print(try usb.send("AT+QPCMV=?"))
+                print(try usb.send("AT+CPAS"))
+                print(try usb.send("AT+CLCC"))
+                print(try usb.send("AT+QCFG=\"volte_disable\""))
+                print(try usb.send("AT+CEER"))
                 print(try usb.send("AT+CSQ"))
                 print(try usb.send("AT+CGDCONT?"))
                 print(try usb.send("AT+CGATT?"))
@@ -1204,9 +1666,9 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 7) {
-                    Text("连接你的 4G 模块")
+                    Text("DJI 4G 模块")
                         .font(.system(size: 28, weight: .semibold, design: .rounded))
-                    Text("插入自己的 SIM 卡，让 MacBook 直接使用移动网络。")
+                    Text("自动识别模块，先打开控制接口，再按需启用 USB 4G 网络。")
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -1228,24 +1690,24 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 20) {
             SectionTitle(icon: "cable.connector", title: "设备与网络")
 
-            VStack(alignment: .leading, spacing: 8) {
-                FieldLabel("模块串口")
-                HStack(spacing: 8) {
-                    Image(systemName: "externaldrive.connected.to.line.below")
-                        .foregroundStyle(Color.accentColor)
-                    Picker("串口", selection: $modem.selectedPort) {
-                        if modem.ports.isEmpty {
-                            Text(modem.network == nil ? "未发现串口" : "网卡已连接，无需串口").tag("")
-                        }
-                        ForEach(modem.ports, id: \.self) { port in Text(port.replacingOccurrences(of: "/dev/", with: "")).tag(port) }
+            VStack(alignment: .leading, spacing: 10) {
+                FieldLabel("设备发现")
+                HStack(spacing: 10) {
+                    Image(systemName: modem.hardwareConnected ? "checkmark.circle.fill" : "cable.connector.horizontal")
+                        .foregroundStyle(modem.hardwareConnected ? .green : .secondary)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(modem.hardwareConnected ? "DJI/Baiwang 模块已识别" : "等待插入 DJI 4G 模块")
+                            .font(.callout.weight(.medium))
+                        Text(modem.atConnected ? "AT 控制接口已自动打开" : modem.hardwareConnected ? "正在寻找 AT/USB AT 接口" : "支持 USB-C 数据线")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
-                    .labelsHidden()
+                    Spacer()
                     Button { modem.refreshPorts() } label: { Image(systemName: "arrow.clockwise") }
                         .buttonStyle(.borderless)
-                        .help("重新扫描")
+                        .help("重新扫描设备")
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
+                .padding(12)
                 .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
             }
 
@@ -1261,15 +1723,15 @@ struct ContentView: View {
             } label: {
                 HStack {
                     Image(systemName: modem.isConnected ? "stop.fill" : "bolt.fill")
-                    Text(modem.isConnected ? "断开 4G" : "开始连接")
+                    Text(modem.isConnected ? "关闭 4G 网络" : "启用 4G 网络")
                 }
                 .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
-            .disabled(modem.state == .connecting)
+            .disabled(modem.state == .connecting || !modem.hardwareConnected)
 
-            Text("连接过程只修改本次会话的网络设置，不会刷写或永久修改模块。")
+            Text("启动时自动识别设备和 AT 接口；关闭 4G 只关闭数据网络，不拔出模块，也不会刷写固件。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1286,6 +1748,8 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 16) {
                 InfoRow(label: "运营商", value: modem.operatorName, icon: "building.2")
                 InfoRow(label: "本机号码", value: modem.localNumber, icon: "phone")
+                InfoRow(label: "SIM 卡", value: modem.simStatus, icon: "simcard")
+                InfoRow(label: "网络注册", value: modem.registrationStatus, icon: "antenna.radiowaves.left.and.right")
                 InfoRow(label: "USB 模式", value: modem.usbMode, icon: "arrow.triangle.branch")
                 InfoRow(label: "信号", value: modem.signalText, icon: "cellularbars")
                 InfoRow(label: "USB 网卡", value: modem.network?.device ?? "等待出现", icon: "network")
@@ -1295,11 +1759,15 @@ struct ContentView: View {
             Spacer(minLength: 0)
 
             if modem.isConnected {
-                Label(modem.network?.address == nil ? "正在等待 DHCP 地址" : "MacBook 正在使用 USB 4G 网络", systemImage: modem.network?.address == nil ? "hourglass" : "checkmark.circle.fill")
+                Label("MacBook 正在使用 USB 4G 网络", systemImage: "checkmark.circle.fill")
                     .font(.callout.weight(.medium))
-                    .foregroundStyle(modem.network?.address == nil ? .orange : .green)
+                    .foregroundStyle(.green)
+            } else if modem.hardwareConnected {
+                Label(modem.atConnected ? "模块已就绪，点击启用 4G 网络" : "模块已识别，等待 AT 接口", systemImage: modem.atConnected ? "bolt" : "hourglass")
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.orange)
             } else {
-                Text("连接后，这里会显示运营商、信号和 IP 地址。")
+                Text("插入模块后，这里会显示运营商、SIM、信号和 IP 地址。")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1423,7 +1891,6 @@ struct ContentView: View {
         }
         .padding(32)
         .onAppear { modem.startSMSAutoRefresh() }
-        .onDisappear { modem.stopSMSAutoRefresh() }
     }
 
     private var phoneContent: some View {
@@ -1437,6 +1904,12 @@ struct ContentView: View {
                         .textFieldStyle(.roundedBorder)
                         .font(.title3.monospacedDigit())
                     HStack(spacing: 10) {
+                        Button { modem.answerCall() } label: {
+                            Label("接听", systemImage: "phone.fill")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
                         Button { modem.dial(phoneNumber) } label: {
                             Label("拨打", systemImage: "phone.fill")
                                 .frame(maxWidth: .infinity)
@@ -1464,18 +1937,18 @@ struct ContentView: View {
                         .font(.title3.weight(.medium))
                     Text(modem.voiceStatus)
                         .font(.callout.weight(.medium))
-                        .foregroundStyle(modem.voiceStatus.contains("未") || modem.voiceStatus.contains("不支持") ? .orange : .secondary)
+                        .foregroundStyle(modem.voiceStatus.contains("未") || modem.voiceStatus.contains("缺少") ? .orange : .secondary)
                     if modem.voiceStatus.contains("IMS 未开启") || modem.voiceStatus.contains("USB 音频未启用") {
                         Button {
                             modem.applyVoiceConfiguration()
                         } label: {
-                            Label(modem.isApplyingVoiceConfiguration ? "正在应用…" : "启用语音并重启模块", systemImage: "waveform")
+                            Label(modem.isApplyingVoiceConfiguration ? "正在应用…" : "启用 IMS/UAC 并重启", systemImage: "waveform")
                         }
                         .buttonStyle(.bordered)
                         .disabled(modem.isApplyingVoiceConfiguration)
                     }
-                    if modem.voiceStatus.contains("媒体路由不支持") {
-                        Text("模块已被 Mac 识别为 USB 音频设备，但当前固件没有提供通话媒体路由，所以只能建立通话信令，声音不会进入 Mac 的扬声器或麦克风。")
+                    if modem.voiceStatus.contains("缺少模块语音运行时") {
+                        Text("当前 QDC507 固件拒绝 QPCMV 媒体路由指令。安装模块端语音运行时前，软件可以识别拨号与来电，但不会冒充已打通音频。")
                             .font(.caption)
                             .foregroundStyle(.orange)
                             .fixedSize(horizontal: false, vertical: true)
@@ -1560,6 +2033,8 @@ struct ContentView: View {
     }
 }
 
+DJI4GConnectApp.main()
+
 struct Sidebar: View {
     @EnvironmentObject private var modem: ModemManager
     @Binding var selectedSection: AppSection
@@ -1580,14 +2055,14 @@ struct Sidebar: View {
             }
             .padding(.bottom, 42)
 
-            Text("使用流程")
+            Text("设备流程")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .padding(.bottom, 14)
 
-            StepRow(number: "1", title: "连接模块", detail: modem.network != nil ? "Baiwang 网卡已连接" : modem.ports.isEmpty ? "等待 USB 设备" : "已发现串口", active: modem.state == .disconnected || modem.state == .error)
-            StepRow(number: "2", title: "自动配置网络", detail: "根据运营商自动选择接入点", active: !modem.isConnected)
-            StepRow(number: "3", title: "开始上网", detail: modem.isConnected ? "网络已就绪" : "等待连接", active: modem.isConnected)
+            StepRow(number: "1", title: "识别模块", detail: modem.hardwareConnected ? "DJI/Baiwang 已发现" : "等待 USB 设备", active: !modem.hardwareConnected)
+            StepRow(number: "2", title: "打开控制接口", detail: modem.atConnected ? "AT 接口已就绪" : modem.hardwareConnected ? "正在自动打开" : "等待模块", active: modem.hardwareConnected && !modem.atConnected)
+            StepRow(number: "3", title: "启用 4G 网络", detail: modem.isConnected ? "USB 网卡已获取 IP" : modem.hardwareConnected ? "按需启用数据网络" : "等待模块", active: modem.hardwareConnected && !modem.isConnected)
 
             VStack(alignment: .leading, spacing: 6) {
                 NavRow(title: "总览", icon: "rectangle.3.group", selected: selectedSection == .overview) { selectedSection = .overview }
@@ -1768,9 +2243,9 @@ struct StatusPill: View {
     let state: ConnectionState
 
     var body: some View {
-        Label(state.title, systemImage: state == .connected ? "checkmark.circle.fill" : state == .connecting ? "arrow.triangle.2.circlepath" : state == .error ? "exclamationmark.circle.fill" : "circle")
+        Label(state.title, systemImage: state == .connected ? "checkmark.circle.fill" : state == .detected ? "externaldrive.connected.to.line.below" : state == .connecting ? "arrow.triangle.2.circlepath" : state == .error ? "exclamationmark.circle.fill" : "circle")
             .font(.callout.weight(.medium))
-            .foregroundStyle(state == .connected ? .green : state == .error ? .red : .secondary)
+            .foregroundStyle(state == .connected ? .green : state == .error ? .red : state == .detected ? .orange : .secondary)
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .background(Color(nsColor: .controlBackgroundColor), in: Capsule())

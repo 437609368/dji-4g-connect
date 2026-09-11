@@ -33,6 +33,12 @@ mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources" "$APP_DIR/Conte
 cp "$BUILD_DIR/DJI4GConnect" "$APP_DIR/Contents/MacOS/DJI4GConnect"
 cp "$ROOT/Info.plist" "$APP_DIR/Contents/Info.plist"
 cp "$LIBUSB_LIBRARY" "$APP_DIR/Contents/Frameworks/libusb-1.0.0.dylib"
+mkdir -p "$APP_DIR/Contents/Resources/backend" "$APP_DIR/Contents/Resources/licenses/DJOneHub"
+cp "$ROOT/vendor/djonehub/djonehubd" "$APP_DIR/Contents/Resources/backend/djonehubd"
+cp "$LIBUSB_LIBRARY" "$APP_DIR/Contents/Resources/backend/libusb-1.0.0.dylib"
+cp "$ROOT/vendor/djonehub/LICENSE" "$APP_DIR/Contents/Resources/licenses/DJOneHub/LICENSE"
+cp "$ROOT/vendor/djonehub/THIRD_PARTY_NOTICES.md" "$APP_DIR/Contents/Resources/licenses/DJOneHub/THIRD_PARTY_NOTICES.md"
+chmod 755 "$APP_DIR/Contents/Resources/backend/djonehubd"
 install_name_tool -id "@rpath/libusb-1.0.0.dylib" "$APP_DIR/Contents/Frameworks/libusb-1.0.0.dylib"
 install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_DIR/Contents/MacOS/DJI4GConnect"
 
