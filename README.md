@@ -43,7 +43,7 @@ CallKit 只提供系统通话界面；模块的 USB 音频或云端 SIP/WebRTC/P
 
 需要 macOS 13+ 和 Swift 6。当前机器如果没有完整 Xcode，也可以使用 Command Line Tools 构建：
 
-当前 Apple Silicon 测试版：[DJI-4G-Connect-v0.1.5-arm64.zip](DJI-4G-Connect-v0.1.5-arm64.zip)
+当前 Apple Silicon 版：[DJI-4G-Connect-v0.1.6-arm64.zip](DJI-4G-Connect-v0.1.6-arm64.zip)
 
 ```bash
 ./build_app.sh
